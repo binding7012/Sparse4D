@@ -83,6 +83,9 @@ PS: In the nuscenes leaderboard, Sparse4Dv3 selected external data=True because 
     Eprint = {arXiv:2211.10581},
 }
 ```
+## How to Use MIOPEN and HIPBLASLT tuning result
+- export MIOPEN_USER_DB_PATH=/path/to/Sparse4D/tune_result/sparse4d_miopen_tuning
+- export HIPBLASLT_TUNING_OVERRIDE_FILE=/path/to/Sparse4D/tune_result/tune_gemm_results.txt
 
 ## Acknowledgement
 - [BEVFormer](https://github.com/fundamentalvision/BEVFormer)
