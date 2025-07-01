@@ -203,9 +203,24 @@ class DeformableFeatureAggregation(BaseModule):
         pts_extend = torch.cat(
             [key_points, torch.ones_like(key_points[..., :1])], dim=-1
         )
-        points_2d = torch.matmul(
-            projection_mat[:, :, None, None], pts_extend[:, None, ..., None]
-        ).squeeze(-1)
+        #points_2d = torch.matmul(
+        #    projection_mat[:, :, None, None], pts_extend[:, None, ..., None]
+        #).squeeze(-1)
+
+        points_extend = pts_extend[:, None, ..., None]
+        projection_mat_extend = projection_mat[:, :, None, None]
+        points_shape = points_extend.shape
+        projection_mat_shape = projection_mat_extend.shape
+
+        points = points_extend.repeat(1,projection_mat_shape[1],1,1,1,1)
+        post_rots = projection_mat_extend.repeat(1,1,points_shape[2],points_shape[3],1,1)
+        post_rots = projection_mat_extend
+        a,b,c,d,e,f = points.shape
+
+        output = post_rots.reshape(-1,4,4).matmul(points.view(a*b,c*d,e*f).permute(0,2,1))
+        output = output.permute(0,2,1).view(a,b,c,d,e,f)
+        points_2d = output.squeeze(-1)
+
         points_2d = points_2d[..., :2] / torch.clamp(
             points_2d[..., 2:3], min=1e-5
         )
