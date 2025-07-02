@@ -1,0 +1,1 @@
+bash local_train.sh sparse4dv3_temporal_r50_1x8_bs6_256x704-profile
