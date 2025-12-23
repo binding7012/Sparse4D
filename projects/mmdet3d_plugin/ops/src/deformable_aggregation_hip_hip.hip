@@ -8,12 +8,13 @@
 #include <stdlib.h>
 #include <cmath>
 
+#define FORWARD_BLOCK_SIZE 256
+#define FORWARD_POSITIONS_PER_THREAD 8
 
-__device__ float bilinear_sampling(
-    const float *&bottom_data, const int &height, const int &width,
-    const int &num_embeds, const float &h_im, const float &w_im,
-    const int &base_ptr
-) {
+__device__ __forceinline__ float
+bilinear_sampling(const float *__restrict__ bottom_data, const int height,
+                  const int width, const int num_embeds, const float h_im,
+                  const float w_im, const int base_ptr) {
   const int h_low = floorf(h_im);
   const int w_low = floorf(w_im);
   const int h_high = h_low + 1;
@@ -139,67 +140,117 @@ __device__ void compute_bilinear_grad(
   out_grad_weight_contrib = grad_output_val * interpolated_val;
 }
 
+// Forward kernel: one thread processes FORWARD_POSITIONS_PER_THREAD positions
+// (across cam_scale dimension)
+__global__
+__launch_bounds__(FORWARD_BLOCK_SIZE) void deformable_aggregation_kernel(
+    const int num_kernels, float *__restrict__ output,
+    const float *__restrict__ mc_ms_feat, const int *__restrict__ spatial_shape,
+    const int *__restrict__ scale_start_index,
+    const float *__restrict__ sample_location,
+    const float *__restrict__ weights, const int batch_size, const int num_cams,
+    const int num_feat, const int num_embeds, const int num_scale,
+    const int num_anchors, const int num_pts, const int num_groups) {
 
-__global__ void deformable_aggregation_kernel(
-    const int num_kernels,
-    float* output,
-    const float* mc_ms_feat,
-    const int* spatial_shape,
-    const int* scale_start_index,
-    const float* sample_location,
-    const float* weights,
-    int batch_size,
-    int num_cams,
-    int num_feat,
-    int num_embeds,
-    int num_scale,
-    int num_anchors,
-    int num_pts,
-    int num_groups
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= num_kernels) return;
+  // Each thread processes FORWARD_POSITIONS_PER_THREAD positions
+  // We iterate over cam_scale combinations in groups of
+  // FORWARD_POSITIONS_PER_THREAD
+  const int num_cam_scale = num_cams * num_scale;
+  const int num_cam_scale_groups =
+      (num_cam_scale + FORWARD_POSITIONS_PER_THREAD - 1) /
+      FORWARD_POSITIONS_PER_THREAD;
 
-    const float weight = *(weights + idx / (num_embeds / num_groups));
-    const int channel_index = idx % num_embeds;
-    idx /= num_embeds;
-    const int scale_index = idx % num_scale;
-    idx /= num_scale;
+  // Total work items: batch * anchors * pts * embeds * cam_scale_groups
+  const int total_work =
+      batch_size * num_anchors * num_pts * num_embeds * num_cam_scale_groups;
 
-    const int cam_index = idx % num_cams;
-    idx /= num_cams;
-    const int pts_index = idx % num_pts;
-    idx /= num_pts;
+  int work_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (work_idx >= total_work)
+    return;
 
-    int anchor_index = idx % num_anchors;
-    idx /= num_anchors;
-    const int batch_index = idx % batch_size;
-    idx /= batch_size;
+  // Decode work index
+  const int channel_index = work_idx % num_embeds;
+  work_idx /= num_embeds;
+  const int cam_scale_group = work_idx % num_cam_scale_groups;
+  work_idx /= num_cam_scale_groups;
+  const int pts_index = work_idx % num_pts;
+  work_idx /= num_pts;
+  int anchor_index = work_idx % num_anchors;
+  work_idx /= num_anchors;
+  const int batch_index = work_idx;
 
-    anchor_index = batch_index * num_anchors + anchor_index;
-    const int loc_offset = ((anchor_index * num_pts + pts_index) * num_cams + cam_index) << 1;
+  anchor_index = batch_index * num_anchors + anchor_index;
 
-    const float loc_w = sample_location[loc_offset];
-    if (loc_w <= 0 || loc_w >= 1) return;
-    const float loc_h = sample_location[loc_offset + 1];
-    if (loc_h <= 0 || loc_h >= 1) return;
+  // Calculate location offset for this anchor/pts combination
+  // sample_location layout: [batch, anchors, pts, cams, 2]
+  const int loc_base = (anchor_index * num_pts + pts_index) * num_cams;
 
-    int cam_scale_index = cam_index * num_scale + scale_index;
-    const int value_offset = (batch_index * num_feat + scale_start_index[cam_scale_index]) * num_embeds + channel_index;
+  // Use float2 for vectorized load of sample_location
+  const float2 *sample_location_vec =
+      reinterpret_cast<const float2 *>(sample_location);
 
-    cam_scale_index = cam_scale_index << 1;
-    const int h = spatial_shape[cam_scale_index];
-    const int w = spatial_shape[cam_scale_index + 1];
+  // Use int2 for vectorized load of spatial_shape
+  const int2 *spatial_shape_vec = reinterpret_cast<const int2 *>(spatial_shape);
 
-    const float h_im = loc_h * h - 0.5;
-    const float w_im = loc_w * w - 0.5;
+  // Accumulator for this thread's contribution
+  float accum = 0.0f;
 
-    atomicAdd(
-        output + anchor_index * num_embeds + channel_index,
-        bilinear_sampling(mc_ms_feat, h, w, num_embeds, h_im, w_im, value_offset) * weight
-    );
+  // Process POSITIONS_PER_THREAD positions
+  const int cam_scale_start = cam_scale_group * FORWARD_POSITIONS_PER_THREAD;
+
+#pragma unroll
+  for (int i = 0; i < FORWARD_POSITIONS_PER_THREAD; i++) {
+    const int cam_scale_idx = cam_scale_start + i;
+    if (cam_scale_idx >= num_cam_scale)
+      break;
+
+    const int cam_index = cam_scale_idx / num_scale;
+    const int scale_index = cam_scale_idx % num_scale;
+
+    // Vectorized load of sample_location (loc_w, loc_h)
+    const int loc_offset = loc_base + cam_index;
+    float2 loc = sample_location_vec[loc_offset];
+    const float loc_w = loc.x;
+    const float loc_h = loc.y;
+
+    // Early exit for invalid locations
+    if (loc_w <= 0 || loc_w >= 1 || loc_h <= 0 || loc_h >= 1)
+      continue;
+
+    // Vectorized load of spatial_shape (h, w)
+    int2 shape = spatial_shape_vec[cam_scale_idx];
+    const int h = shape.x;
+    const int w = shape.y;
+
+    // Calculate weight index
+    // weights layout: [batch, anchors, pts, cams, scales, groups]
+    const int weight_idx =
+        (((anchor_index * num_pts + pts_index) * num_cams + cam_index) *
+             num_scale +
+         scale_index) *
+            num_groups +
+        (channel_index / (num_embeds / num_groups));
+    const float weight = weights[weight_idx];
+
+    // Calculate feature offset
+    const int value_offset =
+        (batch_index * num_feat + scale_start_index[cam_scale_idx]) *
+            num_embeds +
+        channel_index;
+
+    const float h_im = loc_h * h - 0.5f;
+    const float w_im = loc_w * w - 0.5f;
+
+    accum += bilinear_sampling(mc_ms_feat, h, w, num_embeds, h_im, w_im,
+                               value_offset) *
+             weight;
+  }
+
+  // Atomic add to output
+  if (accum != 0.0f) {
+    atomicAdd(output + anchor_index * num_embeds + channel_index, accum);
+  }
 }
-
 
 __global__ void deformable_aggregation_grad_kernel(
     const int num_total_threads,
@@ -348,31 +399,27 @@ __global__ void deformable_aggregation_grad_kernel(
     }
 }
 
-void deformable_aggregation(
-    float* output,
-    const float* mc_ms_feat,
-    const int* spatial_shape,
-    const int* scale_start_index,
-    const float* sample_location,
-    const float* weights,
-    int batch_size,
-    int num_cams,
-    int num_feat,
-    int num_embeds,
-    int num_scale,
-    int num_anchors,
-    int num_pts,
-    int num_groups
-) {
-    const int num_kernels = batch_size * num_pts * num_embeds * num_anchors * num_cams * num_scale;
-   hipLaunchKernelGGL(( deformable_aggregation_kernel)
-        , dim3((int)ceil(((double)num_kernels/128))), dim3(128), 0, 0, 
-        num_kernels, output,
-        mc_ms_feat, spatial_shape, scale_start_index, sample_location, weights,
-        batch_size, num_cams, num_feat, num_embeds, num_scale, num_anchors, num_pts, num_groups
-    );
+void deformable_aggregation(float *output, const float *mc_ms_feat,
+                            const int *spatial_shape,
+                            const int *scale_start_index,
+                            const float *sample_location, const float *weights,
+                            int batch_size, int num_cams, int num_feat,
+                            int num_embeds, int num_scale, int num_anchors,
+                            int num_pts, int num_groups) {
+  const int num_cam_scale = num_cams * num_scale;
+  const int num_cam_scale_groups =
+      (num_cam_scale + FORWARD_POSITIONS_PER_THREAD - 1) /
+      FORWARD_POSITIONS_PER_THREAD;
+  const int num_kernels =
+      batch_size * num_anchors * num_pts * num_embeds * num_cam_scale_groups;
+  const int block_size = FORWARD_BLOCK_SIZE;
+  const int grid_size = (num_kernels + block_size - 1) / block_size;
+  hipLaunchKernelGGL(deformable_aggregation_kernel, dim3(grid_size),
+                     dim3(block_size), 0, 0, num_kernels, output, mc_ms_feat,
+                     spatial_shape, scale_start_index, sample_location, weights,
+                     batch_size, num_cams, num_feat, num_embeds, num_scale,
+                     num_anchors, num_pts, num_groups);
 }
-
 
 void deformable_aggregation_grad(
   const float* mc_ms_feat,
